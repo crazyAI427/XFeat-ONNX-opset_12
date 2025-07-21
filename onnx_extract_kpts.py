@@ -9,7 +9,7 @@ from utils import draw_points, load_image
 
 def main():
     # Setting variables
-    dense = True  # Dense keypoints extraction
+    dense = False  # Dense keypoints extraction
     multiscale = False  # Dense mode: enable multiscale
 
     # Get image and load
@@ -18,7 +18,7 @@ def main():
     imgRGB = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     # Create model
-    fname_model = "weights/xfeat.onnx"
+    fname_model = "weights/xfeet/xfeat.onnx"
     if dense:
         fname_model = fname_model.replace(".onnx", "_dense.onnx")
 
@@ -31,6 +31,7 @@ def main():
 
     # Run model
     results = session.run(output_names, {input_names: img_tensor})
+    print(f"Len {len(results[0])}")
     img = draw_points(img, results[0])
 
     # Show

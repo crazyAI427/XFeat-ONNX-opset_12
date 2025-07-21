@@ -7,7 +7,7 @@ from utils import draw_points, load_image
 
 def main():
     # Setting variables
-    dense = True                    # Dense keypoints extraction
+    dense = False                    # Dense keypoints extraction
     multiscale = False              # Dense mode: enable multiscale
 
     # Get image and load

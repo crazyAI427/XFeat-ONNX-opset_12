@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--xfeat_path",
         type=str,
-        default="weights/xfeat.pt",
+        default="weights/xfeat_learn_steer.pth",
         required=False,
         help="Path to load the feature extractor PT model.",
     )
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--top_k",
         type=int,
-        default=None,
+        default=2048,
         required=False,
         help="Maximum number of keypoints outputted by the extractor.",
     )
@@ -107,7 +107,7 @@ def export_onnx(
             do_constant_folding=True,
             input_names=["image0", "image1"],
             output_names=["mkpts0", "mkpts1"],
-            opset_version=17,
+            opset_version=12,
             dynamic_axes=dynamic_axes,
         )
 
@@ -151,7 +151,7 @@ def export_onnx(
             do_constant_folding=True,
             input_names=["images"],
             output_names=output_names,
-            opset_version=17,
+            opset_version=12,
             dynamic_axes=dynamic_axes,
         )
 
@@ -189,10 +189,10 @@ def export_onnx(
             tuple(input_values),
             output_matching_path,
             verbose=False,
-            do_constant_folding=False,
+            do_constant_folding=True,
             input_names=input_names,
             output_names=["mkpts0", "mkpts1"],
-            opset_version=17,
+            opset_version=12,
             dynamic_axes=dynamic_axes,
         )
 

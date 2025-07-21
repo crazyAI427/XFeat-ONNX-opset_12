@@ -69,7 +69,9 @@ def load_image(
 
 
 def draw_points(img, points, size=2, color=(255, 0, 0), thickness=-1):
+    
     for p in points:
+        print(f"x: {p[0]}  y: {p[1]}")
         cv2.circle(img, tuple((int(p[0]), int(p[1]))), size, color, thickness)
     return img
 

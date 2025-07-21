@@ -8,71 +8,64 @@ from utils import draw_matches
 
 
 def main():
-    # Setting variables
-    dense = True  # Dense keypoints extraction
-    multiscale = False  # Dense mode: enable multiscale
 
-    # Get image and load
-    fname_img_ref = "assets/ref.png"
-    fname_img_curr = "assets/tgt.png"
-    img_ref = cv2.imread(fname_img_ref)
-    img_curr = cv2.imread(fname_img_curr)
+    # ── file paths ───────────────────────────────────────────────────────────
+    img_ref_path   = "assets/ref.png"
+    img_curr_path  = "assets/tgt.png"
+    ext_model_path = "weights/xfeet/xfeat.onnx"
+    match_model_path = "weights/xfeet/matching.onnx"
 
-    # Create models
-    fname_model = "weights/xfeat.onnx"
-    fname_match_model = "weights/matching.onnx"
 
-    # Check dense
-    if dense:
-        fname_model = fname_model.replace(".onnx", "_dense.onnx")
-        fname_match_model = fname_match_model.replace(".onnx", "_dense.onnx")
+    # ── load images ──────────────────────────────────────────────────────────
+    img_ref   = cv2.imread(img_ref_path)
+    img_curr  = cv2.imread(img_curr_path)
+    img_ref_rgb  = cv2.cvtColor(img_ref,  cv2.COLOR_BGR2RGB)
+    img_curr_rgb = cv2.cvtColor(img_curr, cv2.COLOR_BGR2RGB)
 
-    # Create Extractor Model
-    session_ext = onnxruntime.InferenceSession(fname_model)
-    input_ext_names = session_ext.get_inputs()[0].name
-    output_ext_names = [node.name for node in session_ext.get_outputs()]
+    # to NCHW float32, [0,1]
+    ref_tensor  = img_ref_rgb.transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+    curr_tensor = img_curr_rgb.transpose(2, 0, 1)[None].astype(np.float32) / 255.0
 
-    # Create Matching Model
-    session_match = onnxruntime.InferenceSession(fname_match_model)
-    input_match_names = [node.name for node in session_match.get_inputs()]
-    output_match_names = [node.name for node in session_match.get_outputs()]
+    # ── extractor session ────────────────────────────────────────────────────
+    ext_sess   = onnxruntime.InferenceSession(ext_model_path, providers=['CPUExecutionProvider'])
+    x_name     = ext_sess.get_inputs()[0].name
+    y_names    = [out.name for out in ext_sess.get_outputs()]
 
-    # Convert to tensor
-    img_ref_RGB = cv2.cvtColor(img_ref, cv2.COLOR_BGR2RGB)
-    img_curr_RGB = cv2.cvtColor(img_curr, cv2.COLOR_BGR2RGB)
+    ref_feats  = ext_sess.run(y_names, {x_name: ref_tensor})
+    curr_feats = ext_sess.run(y_names, {x_name: curr_tensor})
+    # ── matcher session ──────────────────────────────────────────────────────
+    match_sess = onnxruntime.InferenceSession(match_model_path, providers=['CPUExecutionProvider'])
+    m_in_names = [inp.name for inp in match_sess.get_inputs()]
+    m_out_names= [out.name for out in match_sess.get_outputs()]
 
-    # Parse numpy array to tensor
-    img_ref_tensor = np.array([img_ref_RGB.transpose(2, 0, 1)], dtype=np.float32) / 255.0
-    img_curr_tensor = np.array([img_curr_RGB.transpose(2, 0, 1)], dtype=np.float32) / 255.0
-
-    # Run Extractor model
-    out_ref = session_ext.run(output_ext_names, {input_ext_names: img_ref_tensor})
-    out_curr = session_ext.run(output_ext_names, {input_ext_names: img_curr_tensor})
-
-    # Input tensor
-    input_tensor = {
-        input_match_names[0]: out_ref[0],
-        input_match_names[1]: out_ref[1],
-        input_match_names[2]: out_curr[0],
-        input_match_names[3]: out_curr[1],
+    # assemble inputs ---------------------------------------------------------
+    match_inputs = {
+        m_in_names[0]: ref_feats[0],   # kpts0
+        m_in_names[1]: ref_feats[1],   # feats0
+        m_in_names[2]: curr_feats[0],  # kpts1
+        m_in_names[3]: curr_feats[1],  # feats1
     }
+    outputs = match_sess.run(m_out_names, match_inputs)
 
-    if dense:
-        input_tensor.update({input_match_names[4]: out_ref[2]})
+    mkpts0_pad, mkpts1_pad = outputs
+    valid = np.any(mkpts0_pad != 0, axis=1)
+    mkpts0 = mkpts0_pad[valid]
+    mkpts1 = mkpts1_pad[valid]
+    
+    print(mkpts0)
 
-    # Run Matching model
-    mkpts0, mkpts1 = session_match.run(output_match_names, input_tensor)
-
-    # Draw matches
+    # ── visualise ────────────────────────────────────────────────────────────
     img_matches = draw_matches(mkpts0, mkpts1, img_ref, img_curr)
 
-    # Show
     plt.figure(figsize=(20, 20))
-    plt.imshow(img_matches[..., ::-1])
+    plt.imshow(img_matches[:, :, ::-1])  # BGR→RGB
+    plt.axis("off")
     plt.show()
 
-    # Save if you want
-    cv2.imwrite(os.path.join(os.path.dirname(fname_img_ref), "match" + ("_dense" if dense else "") + "_onnx.png"), img_matches)
+    out_name = os.path.join(os.path.dirname(img_ref_path),
+                            f"match_onnx.png")
+    cv2.imwrite(out_name, img_matches)
+
 
 if __name__ == "__main__":
     main()

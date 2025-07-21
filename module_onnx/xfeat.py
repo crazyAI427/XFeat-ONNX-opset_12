@@ -29,56 +29,54 @@ class XFeat(nn.Module):
 
         self.interpolator = InterpolateSparse2d('bicubic')
 
+    # ========================== XFeat.detectAndCompute ==========================
     @torch.inference_mode()
     def detectAndCompute(self, x):
-        """
-            Compute sparse keypoints & descriptors. Supports batched mode.
+        # ── pre‑process ────────────────────────────────────────────────────────────
+        x, rh, rw       = self.preprocess_tensor(x)        # H, W divisible by 32
+        B, _, Hc, Wc    = x.shape                          # coarse resolution
 
-            input:
-                x -> torch.Tensor(1, C, H, W): grayscale or rgb image
-                top_k -> int: keep best k features
-            return:
-                List[Dict]:
-                    'keypoints'    ->   torch.Tensor(N, 2): keypoints (x,y)
-                    'scores'       ->   torch.Tensor(N,): keypoint scores
-                    'descriptors'  ->   torch.Tensor(N, 64): local features
-        """
-        # image.shape == (1, 3, H, W)
-        x, rh1, rw1 = self.preprocess_tensor(x)
-        _, _, _H1, _W1 = x.shape
+        # ── network forward ───────────────────────────────────────────────────────
+        M, K, Hconf     = self.net(x)                      # M: feats, K: logits
+        M               = F.normalize(M, dim=1)            # channel‑wise ℓ2
 
-        M1, K1, H1 = self.net(x)
-        M1 = F.normalize(M1, dim=1)
+        # ── score map & raw key‑point grid ────────────────────────────────────────
+        heat            = self.get_kpts_heatmap(K)         # (B,1,H*8,W*8)
+        kpts            = self.NMS(heat, 0.05, 5)          # (B, Hc*Wc, 2)
 
-        # Convert logits to heatmap and extract kpts
-        K1h = self.get_kpts_heatmap(K1)
-        mkpts = self.NMS(K1h, threshold=0.05, kernel_size=5)
+        # ── reliability scores (nearest × bilinear) ───────────────────────────────
+        near  = InterpolateSparse2d('nearest')(heat, kpts, Hc, Wc)[..., 0]   # (B, N)
+        bilin = InterpolateSparse2d('bilinear')(Hconf, kpts, Hc, Wc)[..., 0] # (B, N)
 
-        # Compute reliability scores
-        _nearest = InterpolateSparse2d('nearest')
-        _bilinear = InterpolateSparse2d('bilinear')
-        scores = (_nearest(K1h, mkpts, _H1, _W1) * _bilinear(H1, mkpts, _H1, _W1)).squeeze(-1)
-        scores[torch.all(mkpts == 0, dim=-1)] = -1
+        valid           = torch.any(kpts != 0, dim=-1).float()       # (B, N)
+        scores          = near * bilin + (1. - valid) * -1e6         # invalid → −1e6
 
-        # Select top-k features
-        idxs = torch.argsort(-scores)
-        mkpts_x = torch.gather(mkpts[..., 0], -1, idxs)[:, :self.top_k]
-        mkpts_y = torch.gather(mkpts[..., 1], -1, idxs)[:, :self.top_k]
-        mkpts = torch.cat([mkpts_x[..., None], mkpts_y[..., None]], dim=-1)
-        scores = torch.gather(scores, -1, idxs)[:, :self.top_k]
+        # ── keep the best self.top_k per image, already sorted ↓ ─────────────────
+        Kkeep                   = min(self.top_k, scores.shape[-1])
+        scores_top, idx         = torch.topk(scores, Kkeep, dim=-1, largest=True,
+                                            sorted=True)            # (B, K)
 
-        # Interpolate descriptors at kpts positions
-        feats = self.interpolator(M1, mkpts, H=_H1, W=_W1)
+        gather1d                = lambda src: torch.gather(src, -1, idx)
+        k_sel                   = torch.stack([gather1d(kpts[..., 0]),
+                                            gather1d(kpts[..., 1])], dim=-1)  # (B,K,2)
+        f_sel                   = self.interpolator(M, k_sel, Hc, Wc)            # (B,K,64)
 
-        # L2-Normalize
-        feats = F.normalize(feats, dim=-1)
+        # ── rescale to the original image resolution ─────────────────────────────
+        scale                    = torch.tensor([rw, rh], device=k_sel.device).view(1, 1, 2)
+        k_sel                    = k_sel * scale
 
-        # Correct kpt scale
-        mkpts = mkpts * torch.tensor([rw1, rh1], device=mkpts.device).view(1, 1, -1)
-        valid = scores > 0
-        return {'keypoints': mkpts[valid],
-                'descriptors': feats[valid],
-                'scores': scores[valid]}
+        # ── flatten the batch so the public API matches the original ─────────────
+        keypoints   = k_sel.reshape(-1, 2)
+        descriptors = F.normalize(f_sel, dim=-1).reshape(-1, f_sel.shape[-1])
+        scores      = scores_top.reshape(-1)
+
+        return {
+            'keypoints'  : keypoints,
+            'descriptors': descriptors,
+            'scores'     : scores,
+        }
+
+
 
     @torch.inference_mode()
     def detectAndComputeDense(self, x):
@@ -124,12 +122,10 @@ class XFeat(nn.Module):
         H1 = H1[0].permute(1, 2, 0).flatten(0)  # 1, H*W
 
         # _, top_k = torch.topk(H1, k = min(H1.shape[1], top_k), dim=-1)
-        _, top_k = torch.topk(H1, torch.min(torch.from_numpy(np.array([H1.shape[0], self.top_k]))), dim=-1)
-
-        #feats = torch.gather(M1, 1, top_k[..., None].expand(-1, -1, 64))
-        #mkpts = torch.gather(xy1, 1, top_k[..., None].expand(-1, -1, 2))
-        feats = torch.gather(M1, 0, top_k[..., None].expand(-1, 64))
-        mkpts = torch.gather(xy1, 0, top_k[..., None].expand(-1, 2))
+        k = min(H1.shape[0], self.top_k)
+        values, indices = torch.topk(H1, k, dim=0)
+        feats = M1.index_select(0, indices)
+        mkpts = xy1.index_select(0, indices)
 
         # Avoid warning of torch.tensor being treated as a constant when exporting to ONNX
         # mkpts = mkpts * torch.tensor([rw1, rh1], device=mkpts.device).view(1, -1)
@@ -205,8 +201,41 @@ class XFeat(nn.Module):
 
     @torch.inference_mode()
     def match_onnx(self, mkpts0, feats0, mkpts1, feats1):
-        idx0, idx1 = self.match(feats0, feats1, min_cossim=-1)
-        return mkpts0[idx0], mkpts1[idx1]
+        """
+        Mutual‑nearest‑neighbour matcher — TensorRT‑friendly version.
+
+        Returns
+        -------
+        mkpts0_pad, mkpts1_pad :  (top_k, 2)
+            • The coordinates are **exactly** the same as the original
+            implementation for every true match.
+            • Rows where mkpts0_pad[i] == (0,0) contain no match and
+            should be dropped *after* TensorRT inference.
+        """
+
+        # ------------------------------------------------------------------
+        # 1. cosine‑similarity matrix
+        cossim  = feats0 @ feats1.t()                # (N0 (=top_k), N1)
+
+        # 2. best neighbours (row‑wise and column‑wise)
+        _, best1 = torch.max(cossim, dim=1)          # (N0,)  j index
+        _, best0 = torch.max(cossim, dim=0)          # (N1,)  i index
+
+        # 3. mutual check
+        idx0     = torch.arange(best1.size(0), device=best1.device)
+        back     = best0.gather(0, best1)            # (N0,)
+        mutual   = back.eq(idx0).float().unsqueeze(-1)   # (N0,1)  mask 1/0
+
+        # 4. keep coordinates, zero‑out non‑mutual rows
+        mk0_pad = mkpts0 * mutual
+        mk1_pad = mkpts1.index_select(0, best1) * mutual
+
+        # ------------------------------------------------------------------
+        # Shapes are constant (top_k, 2)  →  no NonZero, no dynamic Slice
+        return mk0_pad, mk1_pad
+
+
+
 
     @torch.inference_mode()
     def match_star_onnx(self, mkpts0, feats0, mkpts1, feats1, sc0):
@@ -229,28 +258,28 @@ class XFeat(nn.Module):
 
         return coords
 
-    def refine_matches(self, mkpts0, d0, idx0, mkpts1, d1, idx1, sc0, fine_conf=0.25):
-        feats1 = d0[idx0]  # [idx0_b[:, 0], idx0_b[:, 1]]
-        feats2 = d1[idx1]  # [idx1_b[:, 0], idx1_b[:, 1]]
-        mkpts_0 = mkpts0[idx0]  # [idx0_b[:, 0], idx0_b[:, 1]]
-        mkpts_1 = mkpts1[idx1]  # [idx1_b[:, 0], idx1_b[:, 1]]
-        sc0 = sc0[idx0]  # [idx0_b[:, 0], idx0_b[:, 1]]
+    def refine_matches(self, mk0, d0, i0, mk1, d1, i1, sc0, fine_conf=0.25):
+        f1  = d0.index_select(0, i0)
+        f2  = d1.index_select(0, i1)
+        p0  = mk0.index_select(0, i0)
+        p1  = mk1.index_select(0, i1)
+        sc0 = sc0.index_select(0, i0)
 
-        # Compute fine offsets
-        offsets = self.net.fine_matcher(torch.cat([feats1, feats2], dim=-1))
-        conf = F.softmax(offsets * 3, dim=-1).max(dim=-1)[0]
-        offsets = self.subpix_softmax2d(offsets.view(-1, 8, 8))
+        off   = self.net.fine_matcher(torch.cat([f1, f2], -1))
+        conf  = F.softmax(off*3, -1).max(-1)[0]
+        off   = self.subpix_softmax2d(off.view(-1,8,8))
+        p0   += off * sc0[:, None]
+        p1   += off * sc0[:, None]
 
-        mkpts_0 += offsets * (sc0[:, None])  # *0.9 #* (sc0[:,None])
-        mkpts_1 += offsets * (sc0[:, None])  # *0.9 #* (sc0[:,None])
+        # keep only confident matches without boolean indexing
+        conf_mask = (conf > fine_conf).float()
+        k_good    = int(conf_mask.sum().item())
+        if k_good == 0:
+            return p0[:0], p1[:0]
+        _, top    = torch.topk(conf_mask, k_good)
+        return p0.index_select(0, top), p1.index_select(0, top)
 
-        mask_good = conf > fine_conf
-        mkpts_0 = mkpts_0[mask_good]
-        mkpts_1 = mkpts_1[mask_good]
 
-        # match_mkpts = torch.cat([mkpts_0, mkpts_1], dim=-1)
-        # batch_index = idx0[mask_good]  # idx0_b[mask_good, 0]
-        return mkpts_0, mkpts_1
 
     def preprocess_tensor(self, x):
         """ Guarantee that image is divisible by 32 to avoid aliasing artifacts. """
@@ -271,16 +300,32 @@ class XFeat(nn.Module):
         return heatmap
 
     def NMS(self, x, threshold=0.05, kernel_size=5):
-        _, _, H, W = x.shape
+        # x: (1, 1, H, W)
+        B, _, H, W = x.shape
+        device = x.device
+
         local_max = F.max_pool2d(
-            x,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=kernel_size // 2,
-            return_indices=False,
+            x, kernel_size=kernel_size, stride=1, padding=kernel_size // 2
         )
-        pos = (x == local_max) & (x > threshold)
-        return pos.squeeze().nonzero().flip(-1).reshape(1, -1, 2)
+        keep = (x == local_max) & (x > threshold)  # (B, 1, H, W)
+
+        # Create a full (x, y) coordinate grid
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing='ij'
+        )
+        coords = torch.stack([grid_x, grid_y], dim=-1).view(-1, 2).float()  # (H*W, 2)
+
+        keep_flat = keep.view(B, -1).float()  # (B, H*W)
+        coords = coords.unsqueeze(0).repeat(B, 1, 1)  # (B, H*W, 2)
+
+        mkpts = coords * keep_flat.unsqueeze(-1)  # Zero out non-max entries
+
+        # Remove zeroed-out keypoints (i.e. where keep == 0) later during inference
+        return mkpts  # (B, H*W, 2), filter non-zero later
+
+
 
 
 
